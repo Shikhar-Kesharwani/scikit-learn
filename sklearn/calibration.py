@@ -591,9 +591,7 @@ class CalibratedClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstimator)
         tags = super().__sklearn_tags__()
         estimator_tags = get_tags(self._get_estimator())
         tags.input_tags.sparse = estimator_tags.input_tags.sparse
-        tags.array_api_support = (
-            estimator_tags.array_api_support and self.method == "temperature"
-        )
+        tags.array_api_support = estimator_tags.array_api_support
         return tags
 
 
@@ -725,15 +723,23 @@ def _fit_calibrator(clf, predictions, y, classes, method, xp, sample_weight=None
     calibrators = []
 
     if method in ("isotonic", "sigmoid"):
-        Y = label_binarize(y, classes=classes)
+        predictions_np = np.asarray(move_to(predictions, xp=np, device="cpu"))
+        y_np = np.asarray(move_to(y, xp=np, device="cpu"))
+        sw_np = (
+            np.asarray(move_to(sample_weight, xp=np, device="cpu"))
+            if sample_weight is not None
+            else None
+        )
+
+        Y = label_binarize(y_np, classes=classes)
         label_encoder = LabelEncoder().fit(classes)
         pos_class_indices = label_encoder.transform(clf.classes_)
-        for class_idx, this_pred in zip(pos_class_indices, predictions.T):
+        for class_idx, this_pred in zip(pos_class_indices, predictions_np.T):
             if method == "isotonic":
                 calibrator = IsotonicRegression(out_of_bounds="clip")
             else:  # "sigmoid"
                 calibrator = _SigmoidCalibration()
-            calibrator.fit(this_pred, Y[:, class_idx], sample_weight)
+            calibrator.fit(this_pred, Y[:, class_idx], sw_np)
             calibrators.append(calibrator)
     elif method == "temperature":
         if classes.shape[0] == 2 and predictions.shape[-1] == 1:
@@ -807,13 +813,15 @@ class _CalibratedClassifier:
 
         n_classes = self.classes.shape[0]
 
-        proba = np.zeros((_num_samples(X), n_classes))
-
         if self.method in ("sigmoid", "isotonic"):
+            xp, is_array_api, device = get_namespace_and_device(predictions)
+            predictions_np = np.asarray(move_to(predictions, xp=np, device="cpu"))
+            proba = np.zeros((_num_samples(X), n_classes))
+
             label_encoder = LabelEncoder().fit(self.classes)
             pos_class_indices = label_encoder.transform(self.estimator.classes_)
             for class_idx, this_pred, calibrator in zip(
-                pos_class_indices, predictions.T, self.calibrators
+                pos_class_indices, predictions_np.T, self.calibrators
             ):
                 if n_classes == 2:
                     # When binary, `predictions` consists only of predictions for
@@ -832,6 +840,12 @@ class _CalibratedClassifier:
                 proba = np.divide(
                     proba, denominator, out=uniform_proba, where=denominator != 0
                 )
+            # Deal with cases where the predicted probability minimally exceeds 1.0
+            proba[(1.0 < proba) & (proba <= 1.0 + 1e-5)] = 1.0
+
+            if is_array_api:
+                proba = xp.asarray(proba, dtype=predictions.dtype, device=device)
+            return proba
         elif self.method == "temperature":
             xp, _ = get_namespace(predictions)
             if n_classes == 2 and predictions.shape[-1] == 1:
@@ -842,11 +856,9 @@ class _CalibratedClassifier:
                 if response_method_name == "predict_proba":
                     predictions = xp.concat([1 - predictions, predictions], axis=1)
             proba = self.calibrators[0].predict(predictions)
-
-        # Deal with cases where the predicted probability minimally exceeds 1.0
-        proba[(1.0 < proba) & (proba <= 1.0 + 1e-5)] = 1.0
-
-        return proba
+            # Deal with cases where the predicted probability minimally exceeds 1.0
+            proba[(1.0 < proba) & (proba <= 1.0 + 1e-5)] = 1.0
+            return proba
 
 
 # The max_abs_prediction_threshold was approximated using

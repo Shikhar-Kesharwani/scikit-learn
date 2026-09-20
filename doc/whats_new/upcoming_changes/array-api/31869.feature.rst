@@ -1,0 +1,4 @@
+- :class:`sklearn.calibration.CalibratedClassifierCV` now supports Array API
+  compatible inputs for all calibration methods (``method="sigmoid"``,
+  ``method="isotonic"``, and ``method="temperature"``).
+  By :user:`Shikhar Kesharwani <Shikhar-Kesharwani>`.
